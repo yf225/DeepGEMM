@@ -29,9 +29,19 @@ struct SM90_64x16x32_F32E4M3E4M3_SS {
               scale_d);
     }
 
+    /* FAQ:
+    1. Why is the number of unrolled `d` parameters the same as `N / 2`?
+    Answer: The number of unrolled `d` parameters is the number of FP32 accumulators that the individual math thread has to keep,
+    which for the fixed‑64×N tiles happens to be N ⁄ 2 (64 x N / 128 = N / 2).
+    */
+
     static constexpr int M = 64;
     static constexpr int N = 16;
+    // NOTE(yf225): K is the reduction depth handled by one WGMMA instruction (32 elements for FP8 e4m3).
     static constexpr int K = 32;
+    // NOTE(yf225): kNumAccum is meant to tell each individual math thread how many 32‑bit accumulators (float registers)
+    // it has to keep for the tile that the whole warp‑group is producing. Since we set kNumMathThreadsPerGroup = 128,
+    // we need to divide the total number of accumulators by 128 to get the number of accumulators per math thread.
     static constexpr int kNumAccum = M * N / 128;
 };
 

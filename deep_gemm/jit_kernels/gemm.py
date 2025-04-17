@@ -16,9 +16,10 @@ constexpr auto BLOCK_N = {BLOCK_N};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
 constexpr auto RowwiseScaling = {ROWWISE_SCALING};
+constexpr auto FastAccum = {FAST_ACCUM};
 
 // Make a templated GEMM
-using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, GemmType::Normal, RowwiseScaling>;
+using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, GemmType::Normal, RowwiseScaling, FastAccum>;
 
 // Launch kernel
 auto tma_a_desc = GemmType::make_2d_tma_a_desc(lhs, m);
@@ -113,7 +114,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
 def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
                          rhs: Tuple[torch.Tensor, torch.Tensor],
-                         out: torch.Tensor) -> None:
+                         out: torch.Tensor, fast_accum: bool=False) -> None:
     """
     Do a normal GEMM with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
     LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
@@ -167,10 +168,11 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms, rowwise_scaling=rowwise_scaling)
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)
     scaling_string = 'true' if rowwise_scaling else 'false'
+    fast_accum_string = 'true' if fast_accum else 'false'
     runtime = jit_tuner.compile_and_tune(
         name='gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
-              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast, 'ROWWISE_SCALING' : scaling_string},
+              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast, 'ROWWISE_SCALING' : scaling_string, 'FAST_ACCUM' : fast_accum_string},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
