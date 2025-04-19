@@ -74,19 +74,47 @@ def get_tma_aligned_size(x: int, element_size: int) -> int:
     return ceil_div(x, alignment) * alignment
 
 
-def get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
+def get_col_major_tma_aligned_tensor(
+    x: torch.Tensor,
+    rowwise_scaling: bool = False,
+) -> torch.Tensor:
     """
     Returns TMA-aligned transposed format of the input tensor. `torch.transpose` will be called if necessary.
     If the input tensor is already column-major layout and 16-byte aligned along the M axis
         (thus meets the requirement of LHS scaling tensor in DeepGEMM), this function will do nothing.
 
     Arguments:
-        x: usually the LHS scaling tensor in GEMM.
+        x: Scaling tensor.
+        rowwise_scaling: When True, `x` is expected to be a *1‑D* vector that
+            stores per‑row scaling factors. In this case we only pad the vector
+            length to satisfy the 16‑byte TMA alignment requirement and keep it
+            1‑D. When False (default), the original 2‑/3‑D behaviour is kept.
 
     Returns:
-        The LHS scaling tensor of TMA-aligned transposed format.
+        A tensor whose leading dimension (M axis) is padded to satisfy the
+        16‑byte TMA alignment requirement. The tensor stays 1‑D when
+        `rowwise_scaling` is True, otherwise it follows the original 2‑/3‑D
+        transposed‑column‑major path.
     """
-    # NOTES: for the extreme performance, you may rewrite/fuse this function in CUDA
+    # NOTES: for extreme performance, you may rewrite/fuse this function in CUDA
+
+    # ---- Fast path for row‑wise scaling (1‑D tensor) ------------------------
+    if rowwise_scaling:
+        # Expect exactly one dimension (vector of rowwise scales)
+        assert x.dim() == 1, "For row‑wise scaling the input must be 1‑D."
+
+        aligned_m = get_tma_aligned_size(x.shape[0], x.element_size())
+
+        # Already contiguous & properly aligned → nothing to do
+        if x.stride(0) == 1 and x.shape[0] == aligned_m:
+            return x
+
+        # Allocate an aligned buffer and copy
+        aligned_x = torch.empty((aligned_m,), device=x.device, dtype=x.dtype)
+        aligned_x[: x.shape[0]] = x
+        return aligned_x
+
+    # ---- Original 2‑/3‑D path ----------------------------------------------
     assert x.dim() in (2, 3)
     remove_dim = False
     m, n = x.shape[-2], x.shape[-1]

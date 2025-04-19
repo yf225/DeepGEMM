@@ -22,9 +22,11 @@ constexpr auto kNumGroups = 1;
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
 constexpr auto kIsTMAMulticastOnA = {IS_TMA_MULTICAST_ON_A};
+constexpr auto RowwiseScaling = {ROWWISE_SCALING};
+constexpr auto FastAccum = {FAST_ACCUM};
 
 // Make a templated GEMM
-using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_N_PADDING, kSwizzleDMode, kNumGroups, kNumStages, kNumTMAMulticast, kIsTMAMulticastOnA, GemmType::Normal>;
+using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_N_PADDING, kSwizzleDMode, kNumGroups, kNumStages, kNumTMAMulticast, kIsTMAMulticastOnA, GemmType::Normal, RowwiseScaling, FastAccum>;
 
 // Launch kernel
 auto tma_a_desc = gemm_t::make_2d_tma_a_desc(lhs, m);
@@ -61,7 +63,7 @@ def get_block_n_padding_for_smem_d(block_n: int) -> int:
     return (((padding + requirement[1]) if padding < 0 else padding) * 4) // elem_size
 
 
-def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128) -> Tuple[int, int, int]:
+def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128, rowwise_scaling: bool = False) -> Tuple[int, int, int]:
     # Try swizzle first, as it does not waste shared memory
     swizzle_mode = get_swizzle_mode(block_n)
     block_n_padding = get_block_n_padding_for_smem_d(block_n) if swizzle_mode == 0 else 0
@@ -70,7 +72,13 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
     smem_a_per_stage = block_m * block_k
     smem_scales_a_per_stage = block_m * 4
     smem_b_per_stage = block_n * block_k
-    smem_scales_b = ceil_div(k, block_k) * 4
+    if rowwise_scaling:
+        smem_scales_b = block_n * 4
+    else:
+        smem_scales_b = ceil_div(k, block_k) * 4
+
+    smem_row_scales = ceil_div(block_m * 4, 8) * 8     # float, aligned to 8 B (Barrier)
+    
     smem_barrier = num_stages * 8 * 2
 
     smem_size = 0
@@ -78,7 +86,11 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
     smem_size += num_stages * smem_a_per_stage
     smem_size += num_stages * smem_scales_a_per_stage
     smem_size += num_stages * smem_b_per_stage
-    smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
+    if rowwise_scaling:
+        smem_size += smem_scales_b
+    else:
+        smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
+    smem_size += smem_row_scales
     smem_size += smem_barrier
 
     # Swizzle and padding are not compatible
@@ -89,7 +101,8 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False) -> \
+                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False,
+                     rowwise_scaling: bool = False, fast_accum: bool = False) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
     if not is_grouped_contiguous:
         block_ms = (64, 128, 256)
@@ -135,7 +148,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         # Unrolling both stages and `num_former_iters` will cause large code size
         stage_candidates = (4, 3)
     for num_stages in stage_candidates:
-        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n)
+        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, rowwise_scaling=rowwise_scaling)
         if best_smem_config[0] <= sm90_capacity:
             best_num_stages = num_stages
             break
@@ -168,7 +181,8 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
 def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
                          rhs: Tuple[torch.Tensor, torch.Tensor],
-                         out: torch.Tensor) -> None:
+                         out: torch.Tensor,
+                         fast_accum: bool = False) -> None:
     """
     Do a normal GEMM with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
     LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
@@ -194,8 +208,14 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     # Type and shape checks
     assert m == m_ and n == n_ and k == k_
     assert n > 0 and k > 0
-    assert lhs_scales.shape == (m, (k + 127) // 128)
-    assert rhs_scales.shape == ((n + 127) // 128, (k + 127) // 128)
+    assert lhs_scales.dtype == torch.float32
+    rowwise_scaling = False
+    if lhs_scales.shape != (m, (k + 127) // 128):
+        assert lhs_scales.shape == (m,)
+        assert rhs_scales.shape == (n,)
+        rowwise_scaling = True
+    else:
+        assert rhs_scales.shape == ((n + 127) // 128, (k + 127) // 128)
     assert lhs.dtype == torch.float8_e4m3fn and lhs_scales.dtype == torch.float32
     assert rhs.dtype == torch.float8_e4m3fn and rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
@@ -203,7 +223,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
 
     # LHS scales must be transposed for TMA load, but not for RHS scales
     # NOTES: `get_tma_aligned_lhs_scales` may launch a kernel if not processed by previous kernels
-    lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
+    lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales, rowwise_scaling)
     assert rhs_scales.is_contiguous()
 
     # Do nothing if `m` is zero
@@ -213,8 +233,12 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = get_best_configs(m, n, k, 1, num_sms)
+    num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = get_best_configs(m, n, k, 1, num_sms,
+                                                                                                 rowwise_scaling=rowwise_scaling,
+                                                                                                 fast_accum=fast_accum)
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_config[0])
+    scaling_string = 'true' if rowwise_scaling else 'false'
+    fast_accum_string = 'true' if fast_accum else 'false'
     runtime = jit_tuner.compile_and_tune(
         name='gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
@@ -222,7 +246,9 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
               'BLOCK_N_PADDING': smem_config[2],
               'NUM_STAGES': num_stages,
               'NUM_TMA_MULTICAST': tma_multicast_config[0],
-              'IS_TMA_MULTICAST_ON_A': tma_multicast_config[1]},
+              'IS_TMA_MULTICAST_ON_A': tma_multicast_config[1],
+              'ROWWISE_SCALING': scaling_string,
+              'FAST_ACCUM': fast_accum_string},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
