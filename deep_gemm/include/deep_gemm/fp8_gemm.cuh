@@ -50,7 +50,8 @@ template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           GemmType kGemmType,
-          bool RowwiseScaling>
+          bool RowwiseScaling,
+          bool FastAccum>
 __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), 1)
 fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 uint32_t shape_m,
@@ -63,6 +64,10 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
     DG_STATIC_ASSERT(ceil_div(BLOCK_N, BLOCK_K) == 1 or (constexpr_gcd(BLOCK_N, BLOCK_K) == BLOCK_N - BLOCK_K), "Too much B scales in a single block");
     DG_STATIC_ASSERT(!RowwiseScaling || kGemmType == GemmType::Normal, "Rowwise scaling only supports normal GEMM");
+    DG_STATIC_ASSERT(!FastAccum || kGemmType == GemmType::Normal, "FastAccum only supports normal GEMM");
+    if constexpr (FastAccum) {
+        DG_STATIC_ASSERT(RowwiseScaling, "FastAccum is only supported when RowwiseScaling is enabled");
+    }
 
     // Types
     using WGMMA = typename FP8MMASelector<BLOCK_N>::type;
@@ -79,6 +84,8 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     static constexpr uint32_t SMEM_SCALES_B_SIZE_UNALIGNED = RowwiseScaling ? BLOCK_N * sizeof(float) : SHAPE_K_SCALES * (kMustUseUniformedScaleB ? 1 : 2) * sizeof(float);
     // need to align shared mem slice for B scales to barrier size, because next slice is going to be barrier
     static constexpr uint32_t SMEM_SCALES_B_SIZE = ceil_div<uint32_t>(SMEM_SCALES_B_SIZE_UNALIGNED, sizeof(Barrier)) * sizeof(Barrier);
+    // Persistent copy of the A‑row scales (BLOCK_M floats, aligned to Barrier)
+    static constexpr uint32_t SMEM_ROW_SCALES_SIZE = ceil_div<uint32_t>(BLOCK_M * sizeof(float), sizeof(Barrier)) * sizeof(Barrier);
 
     // Configs
     constexpr uint32_t kFullKOfAllStages = kNumStages * BLOCK_K;
@@ -111,6 +118,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     __nv_fp8_e4m3* smem_b[kNumStages];
     float* smem_scales_a[kNumStages];
     float* smem_scales_b;
+    float* smem_row_scales;
 
     // TMA Barrier for both divisible and non-divisible cases
     Barrier* full_barriers[kNumStages];
@@ -124,9 +132,10 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         smem_scales_a[i] = reinterpret_cast<float*>(smem_buffer + SMEM_D_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE) + i * SMEM_SCALES_A_SIZE_PER_STAGE);
     }
     smem_scales_b = reinterpret_cast<float*>(smem_buffer + SMEM_D_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE));
+    smem_row_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(smem_scales_b) + SMEM_SCALES_B_SIZE);
 
     // Fill barriers
-    auto barrier_start_ptr = reinterpret_cast<Barrier*>(reinterpret_cast<uint8_t*>(smem_scales_b) + SMEM_SCALES_B_SIZE);
+    auto barrier_start_ptr = reinterpret_cast<Barrier*>(reinterpret_cast<uint8_t*>(smem_row_scales) + SMEM_ROW_SCALES_SIZE);
     #pragma unroll
     for (int i = 0; i < kNumStages; ++ i) {
         full_barriers[i] = barrier_start_ptr + i;
@@ -288,7 +297,8 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             // Accumulation for WGMMA or CUDA promotion
             constexpr int WAVE_BLOCK_M = WGMMA::M * get_num_math_warpgroups(BLOCK_M);
             DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0, "Invalid block sizes");
-            float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};
+            float accum[WGMMA::kNumAccum] = {0};
+            float final_accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};
 
             // Empty barrier arrival
             auto empty_barrier_arrive = [&](int s) {
@@ -320,6 +330,22 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     // Wait TMA arrivals
                     full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
 
+                    //------------------------------------------------------------------
+                    // One‑time copy of the BLOCK_M row scales into the persistent slice
+                    //------------------------------------------------------------------
+                    if constexpr (FastAccum) {
+                        if ((k_iter == 0) && (s == 0)) {              // only once per tile
+                            if (warp_idx == 0) {                      // first warp does the copy
+                                #pragma unroll
+                                for (uint32_t r = lane_idx; r < BLOCK_M; r += 32) {
+                                    float v = ld_shared(smem_scales_a[0] + r);
+                                    st_shared(smem_row_scales + r, v);
+                                }
+                            }
+                            cutlass::arch::NamedBarrier(kNumMathThreads).sync();   // ensure visibility
+                        }
+                    }
+
                     // TODO: remove some useless computation for unaligned Ms
                     #pragma unroll
                     for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) {
@@ -339,7 +365,14 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     	for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
                             auto desc_a = make_smem_desc(smem_a[s] + (math_wg_idx * WGMMA::M + m_offset) * BLOCK_K + k * WGMMA::K, 1);
                             auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
-                            WGMMA::wgmma(desc_a, desc_b, accum, k);
+                            // NOTE(yf225): `scale_d` is true: D = A*B+D, false: D = A*B
+                            bool scale_d;
+                            if constexpr (FastAccum) {
+                                scale_d = true;
+                            } else {
+                                scale_d = k;
+                            }
+                            WGMMA::wgmma(desc_a, desc_b, accum, scale_d);
                     	}
                     	warpgroup_commit_batch();
                     	#pragma unroll
@@ -351,29 +384,31 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         if (local_idx == BLOCK_M / WAVE_BLOCK_M - 1)
                     	    empty_barrier_arrive(s);
 
-                    	// Promote with scales
-                    	// NOTES: making it as predicates is very important for performance, comparing to two loops
-                        float scale_0_0, scale_1_0;
-                    	float scale_0_1, scale_1_1;
-                        if constexpr(!RowwiseScaling) {
-                            scale_0_0 = scale_a_0 * scale_b_0;
-                            scale_1_0 = scale_a_1 * scale_b_0;
-                            if constexpr (not kMustUseUniformedScaleB)
-                                scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
-                        } else {
-                            scale_0_0 = scale_a_0, scale_1_0 = scale_a_1;
-                        }
+                        if constexpr (!FastAccum) {
+                    	    // Promote with scales
+                    	    // NOTES: making it as predicates is very important for performance, comparing to two loops
+                            float scale_0_0, scale_1_0;
+                    	    float scale_0_1, scale_1_1;
+                            if constexpr(!RowwiseScaling) {
+                                scale_0_0 = scale_a_0 * scale_b_0;
+                                scale_1_0 = scale_a_1 * scale_b_0;
+                                if constexpr (not kMustUseUniformedScaleB)
+                                    scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+                            } else {
+                                scale_0_0 = scale_a_0, scale_1_0 = scale_a_1;
+                            }
 
-                        auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
-                    	#pragma unroll
-                    	for (int i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                            // NOTES: for unrolled `num_former_iters` cases, we expect the compiler to automatically make it a constant
-                            bool predicate = RowwiseScaling or kMustUseUniformedScaleB or i < num_former_iters;
-                            shifted_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
-                            shifted_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
-                            shifted_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
-                            shifted_accum[i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
-                    	}
+                            auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
+                    	    #pragma unroll
+                    	    for (int i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                                // NOTES: for unrolled `num_former_iters` cases, we expect the compiler to automatically make it a constant
+                                bool predicate = RowwiseScaling or kMustUseUniformedScaleB or i < num_former_iters;
+                                shifted_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
+                                shifted_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
+                                shifted_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
+                                shifted_accum[i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
+                    	    }
+                        }
                     }
                 }
 
@@ -441,25 +476,54 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         smem_ptr = reinterpret_cast<uint8_t*>(smem_d + (m_offset + warp_idx * WGMMA_M_PER_WARP + lane_idx) * (BLOCK_N + BLOCK_N_PADDING) + i * 8);
                     }
 
-                    // NOTES: only 16 lanes' addresses are used
+                    nv_bfloat162 v0, v1;
                     if constexpr (RowwiseScaling) {
-                        auto scale_start = i * 8;
-                        int r0 = (lane_idx * 2) % 8;
-                        float s0 = ld_shared(smem_scales_b + scale_start + r0);
-                        float s1 = ld_shared(smem_scales_b + scale_start + r0 + 1);
-                        SM90_U32x2_STSM_N<nv_bfloat162>::copy(
-                            __float22bfloat162_rn({shifted_accum[i * 4 + 0] * s0, shifted_accum[i * 4 + 1] * s1}),
-                            __float22bfloat162_rn({shifted_accum[i * 4 + 2] * s0, shifted_accum[i * 4 + 3] * s1}),
-                            smem_ptr
-                        );
+                        // lane‑local 2‑column pair inside the 8‑column group
+                        int pair_in_group = (lane_idx & 0x3) << 1;       // 0,2,4,6
 
+                        // 8‑column groups are stepped by the loop variable `i`
+                        int col0 = (i << 3) + pair_in_group;             // i*8 + {0,2,4,6}
+                        int col1 = col0 + 1;                             //   + {1,3,5,7}
+
+                        float s0 = ld_shared(smem_scales_b + col0);
+                        float s1 = ld_shared(smem_scales_b + col1);
+
+                        if constexpr (FastAccum) {
+                            // Pre‑load the two row scales that the lane owns (once per warp‑row)
+                            const int row_even = warp_idx * 16 + (lane_idx / 4);  // 0‑7
+                            const int row_odd  = row_even + 8;                                // 8‑15
+                            float a_even = ld_shared(smem_row_scales + row_even);   // ← use persistent copy
+                            float a_odd  = ld_shared(smem_row_scales + row_odd);
+
+                            float as0 = a_even * s0,  as1 = a_even * s1,
+                                as2 = a_odd * s0,  as3 = a_odd * s1;
+
+                            v0 = __float22bfloat162_rn({ accum[i*4 + 0] * as0,
+                                                        accum[i*4 + 1] * as1 });
+                            v1 = __float22bfloat162_rn({ accum[i*4 + 2] * as2,
+                                                        accum[i*4 + 3] * as3 });
+                        } else {
+                            float t0 = shifted_accum[i*4 + 0] * s0;
+                            float t1 = shifted_accum[i*4 + 1] * s1;
+                            float t2 = shifted_accum[i*4 + 2] * s0;
+                            float t3 = shifted_accum[i*4 + 3] * s1;
+                            v0 = __float22bfloat162_rn({ t0, t1 });
+                            v1 = __float22bfloat162_rn({ t2, t3 });
+                        }
                     } else {
-                        SM90_U32x2_STSM_N<nv_bfloat162>::copy(
-                            __float22bfloat162_rn({shifted_accum[i * 4 + 0], shifted_accum[i * 4 + 1]}),
-                            __float22bfloat162_rn({shifted_accum[i * 4 + 2], shifted_accum[i * 4 + 3]}),
-                            smem_ptr
-                        );
+                        // final_accum already holds (sA·sB) products
+                        v0 = __float22bfloat162_rn({ shifted_accum[i*4 + 0],
+                                                    shifted_accum[i*4 + 1] });
+                        v1 = __float22bfloat162_rn({ shifted_accum[i*4 + 2],
+                                                    shifted_accum[i*4 + 3] });
                     }
+
+                    // NOTES: only 16 lanes' addresses are used
+                    SM90_U32x2_STSM_N<nv_bfloat162>::copy(
+                        v0,
+                        v1,
+                        smem_ptr
+                    );
                 }
             }
             cute::tma_store_fence();
@@ -492,7 +556,8 @@ template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumGroups, uint32_t kNumStages,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           GemmType kGemmType,
-          bool RowwiseScaling>
+          bool RowwiseScaling,
+          bool FastAccum>
 class Gemm {
 private:
     using Barrier = cuda::barrier<cuda::thread_scope_block>;
@@ -517,7 +582,7 @@ public:
                                       kSwizzleDMode,
                                       kNumGroups, kNumStages,
                                       kNumTMAThreads, kNumMathThreadsPerGroup,
-                                      kNumTMAMulticast, kIsTMAMulticastOnA, kGemmType, RowwiseScaling>;
+                                      kNumTMAMulticast, kIsTMAMulticastOnA, kGemmType, RowwiseScaling, FastAccum>;
         DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
 
         // Cluster launch
